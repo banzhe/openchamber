@@ -3,7 +3,7 @@ import { opencodeClient } from '@/lib/opencode/client';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { useSessionWorktreeStore } from './session-worktree-store';
-import { routeMessage, useSessionUIStore } from './session-ui-store';
+import { materializeOpenDraftSession, routeMessage, useSessionUIStore } from './session-ui-store';
 import { setActionRefs, setOptimisticRefs } from './session-actions';
 import { useSkillsStore } from '@/stores/useSkillsStore';
 import { useCommandsStore } from '@/stores/useCommandsStore';
@@ -308,6 +308,7 @@ describe('createSession draft lifecycle', () => {
       currentSessionDirectory: null,
       newSessionDraft: {
         open: true,
+        generation: 1,
         selectedProjectId: projectA.id,
         directoryOverride: projectA.path,
         parentID: null,
@@ -330,6 +331,58 @@ describe('createSession draft lifecycle', () => {
     expect(session).toBeNull();
     expect(useSessionUIStore.getState().newSessionDraft.open).toBe(true);
     expect(useSessionUIStore.getState().newSessionDraft.title).toBe('Draft title');
+  });
+
+  test('closes and activates the draft when its owner is unchanged', async () => {
+    const draftOwner = useSessionUIStore.getState().newSessionDraft;
+    opencodeClient.createSession = async () => ({
+      id: 'session-a',
+      directory: projectA.path,
+      time: { created: 1 },
+    });
+
+    const session = await useSessionUIStore.getState().createSession(
+      'Draft title',
+      projectA.path,
+      null,
+      undefined,
+      { draftOwner },
+    );
+
+    expect(session?.id).toBe('session-a');
+    expect(useProjectsStore.getState().activeProjectId).toBe(projectA.id);
+    expect(useDirectoryStore.getState().currentDirectory).toBe(projectA.path);
+    expect(useSessionUIStore.getState()).toMatchObject({
+      currentSessionId: 'session-a',
+      currentSessionDirectory: projectA.path,
+      newSessionDraft: { open: false },
+    });
+  });
+
+  test('keeps ownership when the same draft generation is cloned', async () => {
+    const draftOwner = useSessionUIStore.getState().newSessionDraft;
+    useSessionUIStore.setState({
+      newSessionDraft: { ...draftOwner, permissionAutoAcceptEnabled: true },
+    });
+    opencodeClient.createSession = async () => ({
+      id: 'session-a',
+      directory: projectA.path,
+      time: { created: 1 },
+    });
+
+    await useSessionUIStore.getState().createSession(
+      'Draft title',
+      projectA.path,
+      null,
+      undefined,
+      { draftOwner },
+    );
+
+    expect(useSessionUIStore.getState()).toMatchObject({
+      currentSessionId: 'session-a',
+      currentSessionDirectory: projectA.path,
+      newSessionDraft: { open: false },
+    });
   });
 
   test('keeps a newer project draft active when an earlier session creation completes', async () => {
@@ -361,6 +414,105 @@ describe('createSession draft lifecycle', () => {
 
     expect(session?.id).toBe('session-a');
     expect(createCalls[0].directory).toBe(projectA.path);
+    expect(useProjectsStore.getState().activeProjectId).toBe(projectB.id);
+    expect(useDirectoryStore.getState().currentDirectory).toBe(projectB.path);
+    expect(useSessionUIStore.getState()).toMatchObject({
+      currentSessionId: null,
+      currentSessionDirectory: null,
+      newSessionDraft: {
+        open: true,
+        selectedProjectId: projectB.id,
+        directoryOverride: projectB.path,
+        title: 'Newer draft',
+      },
+    });
+  });
+
+  test('keeps a newer draft active when an unrelated session creation completes', async () => {
+    useSessionUIStore.getState().closeNewSessionDraft();
+    const creationStarted = deferred();
+    const creationResult = deferred();
+    opencodeClient.createSession = async () => {
+      creationStarted.resolve();
+      return creationResult.promise;
+    };
+
+    const pendingSession = useSessionUIStore.getState().createSession('Independent session', projectA.path);
+    await creationStarted.promise;
+
+    useProjectsStore.getState().setActiveProjectIdOnly(projectB.id);
+    useSessionUIStore.getState().openNewSessionDraft({
+      selectedProjectId: projectB.id,
+      directoryOverride: projectB.path,
+      title: 'Newer draft',
+    });
+
+    creationResult.resolve({
+      id: 'session-a',
+      directory: projectA.path,
+      time: { created: 1 },
+    });
+    await pendingSession;
+
+    expect(useProjectsStore.getState().activeProjectId).toBe(projectB.id);
+    expect(useDirectoryStore.getState().currentDirectory).toBe(projectB.path);
+    expect(useSessionUIStore.getState()).toMatchObject({
+      currentSessionId: null,
+      currentSessionDirectory: null,
+      newSessionDraft: {
+        open: true,
+        selectedProjectId: projectB.id,
+        directoryOverride: projectB.path,
+        title: 'Newer draft',
+      },
+    });
+  });
+
+  test('materializes an explicitly captured draft without replacing the newer draft', async () => {
+    const canonicalDirectory = `${projectA.path}/canonical`;
+    const draftA = {
+      ...useSessionUIStore.getState().newSessionDraft,
+      parentID: 'parent-a',
+      syntheticParts: [{ text: 'captured context' }],
+    };
+    useSessionUIStore.setState({ newSessionDraft: draftA });
+
+    useProjectsStore.getState().setActiveProjectIdOnly(projectB.id);
+    useSessionUIStore.getState().openNewSessionDraft({
+      selectedProjectId: projectB.id,
+      directoryOverride: projectB.path,
+      title: 'Newer draft',
+    });
+
+    const createCalls = [];
+    opencodeClient.createSession = async (params, directory) => {
+      createCalls.push({ params, directory });
+      return {
+        id: 'session-a',
+        directory: canonicalDirectory,
+        time: { created: 1 },
+      };
+    };
+
+    const materialized = await materializeOpenDraftSession({
+      providerID: 'provider-a',
+      modelID: 'model-a',
+      agent: 'agent-a',
+    }, draftA);
+
+    expect(materialized).toMatchObject({
+      sessionId: 'session-a',
+      directory: canonicalDirectory,
+      syntheticParts: [{ text: 'captured context' }],
+    });
+    expect(createCalls).toEqual([{
+      params: {
+        title: 'Draft title',
+        parentID: 'parent-a',
+        metadata: undefined,
+      },
+      directory: projectA.path,
+    }]);
     expect(useProjectsStore.getState().activeProjectId).toBe(projectB.id);
     expect(useDirectoryStore.getState().currentDirectory).toBe(projectB.path);
     expect(useSessionUIStore.getState()).toMatchObject({

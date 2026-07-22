@@ -172,7 +172,12 @@ export function routeMessage(params: {
 
 type SendMessageOptions = {
   sessionId?: string
+  draft?: NewSessionDraftState
   delivery?: 'steer'
+}
+
+type CreateSessionOptions = {
+  draftOwner?: NewSessionDraftState
 }
 
 type AssistantMessageSessionExecution = {
@@ -199,6 +204,7 @@ export type { SessionMemoryState } from "./viewport-store"
 
 export type NewSessionDraftState = {
   open: boolean
+  generation?: number
   selectedProjectId?: string | null
   directoryOverride: string | null
   permissionAutoAcceptEnabled?: boolean
@@ -288,7 +294,7 @@ export type SessionUIState = {
     options?: SendMessageOptions,
   ) => Promise<void>
 
-  createSession: (title?: string, directoryOverride?: string | null, parentID?: string | null, metadata?: Record<string, unknown>) => Promise<Session | null>
+  createSession: (title?: string, directoryOverride?: string | null, parentID?: string | null, metadata?: Record<string, unknown>, options?: CreateSessionOptions) => Promise<Session | null>
   deleteSession: (id: string, options?: Record<string, unknown>) => Promise<boolean>
   deleteSessions: (ids: string[], options?: Record<string, unknown>) => Promise<{ deletedIds: string[]; failedIds: string[] }>
   archiveSession: (id: string) => Promise<boolean>
@@ -387,6 +393,18 @@ const DEFAULT_DRAFT: NewSessionDraftState = {
   parentID: null,
 }
 
+let draftGeneration = 0
+
+const nextDraftGeneration = (current?: number): number => {
+  draftGeneration = Math.max(draftGeneration, current ?? 0) + 1
+  return draftGeneration
+}
+
+const ownsCurrentDraft = (owner: NewSessionDraftState, current: NewSessionDraftState): boolean => (
+  current === owner
+  || (owner.generation !== undefined && current.generation === owner.generation)
+)
+
 const activeSessionByRuntime = new Map<string, string | null>()
 type RuntimeSessionMemory = {
   sessionId: string | null
@@ -442,15 +460,17 @@ export async function materializeOpenDraftSession(selection: {
   modelID: string
   agent?: string
   variant?: string
-}): Promise<MaterializedDraftSession | null> {
+}, explicitDraft?: NewSessionDraftState): Promise<MaterializedDraftSession | null> {
   const store = useSessionUIStore.getState()
-  const draft = store.newSessionDraft
+  const draft = explicitDraft ?? store.newSessionDraft
   if (!draft?.open) return null
   const draftPermissionAutoAcceptEnabled = draft.permissionAutoAcceptEnabled === true
 
   const trimmedAgent = typeof selection.agent === "string" && selection.agent.trim().length > 0
     ? selection.agent.trim()
     : undefined
+  const configState = useConfigStore.getState()
+  const effectiveDraftAgent = trimmedAgent ?? configState.currentAgentName
   let draftDirectoryOverride = draft.bootstrapPendingDirectory ?? draft.directoryOverride ?? null
   const draftProjectId = draft.selectedProjectId ?? null
 
@@ -461,22 +481,17 @@ export async function materializeOpenDraftSession(selection: {
 
   await waitForWorktreeBootstrapIfConfigured(draftDirectoryOverride, draftProjectId)
 
-  const created = await store.createSession(draft.title, draftDirectoryOverride, draft.parentID ?? null)
+  const created = await store.createSession(
+    draft.title,
+    draftDirectoryOverride,
+    draft.parentID ?? null,
+    undefined,
+    { draftOwner: draft },
+  )
   if (!created?.id) throw new Error("Failed to create session")
 
-  persistDraftTarget({
-    projectId: draftProjectId,
-    directory: normalizePath(draftDirectoryOverride ?? created.directory ?? null),
-  })
-
   const draftSyntheticParts = draft.syntheticParts
-  const createdDirectory = normalizePath(draftDirectoryOverride ?? created.directory ?? null)
-  const configState = useConfigStore.getState()
-  void activateConfigForDirectory(createdDirectory).catch((error) => {
-    console.warn("Failed to activate directory after creating session:", error)
-  })
-
-  const effectiveDraftAgent = trimmedAgent ?? configState.currentAgentName
+  const createdDirectory = normalizePath(created.directory ?? draftDirectoryOverride ?? null)
 
   useSelectionStore.getState().saveSessionModelSelection(created.id, selection.providerID, selection.modelID)
 
@@ -487,8 +502,6 @@ export async function materializeOpenDraftSession(selection: {
   }
 
   store.initializeNewOpenChamberSession(created.id, configState.agents ?? [])
-
-  store.setCurrentSession(created.id, createdDirectory)
 
   if (draftPermissionAutoAcceptEnabled) {
     void import("@/stores/permissionStore")
@@ -739,6 +752,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
 
     const nextDraft: NewSessionDraftState = {
       open: true,
+      generation: nextDraftGeneration(get().newSessionDraft.generation),
       selectedProjectId: selectedProject?.id ?? null,
       directoryOverride: directory,
       permissionAutoAcceptEnabled: options?.permissionAutoAcceptEnabled === true,
@@ -779,6 +793,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
     // (a fresh draft must start from defaults, not inherit the previous session's selection).
     const configDirectory = normalizePath(selectedProject?.path ?? null) ?? directory
     void activateConfigForDirectory(configDirectory).then(() => {
+      if (!ownsCurrentDraft(nextDraft, get().newSessionDraft)) return
       useConfigStore.getState().applyDefaultModelAgentSelection({
         projectDefaultModel: selectedProject?.defaultModel,
       })
@@ -816,10 +831,16 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
     let nextDirectory: string | null = null
     set((s) => {
       nextDirectory = normalizePath(target.directoryOverride ?? s.newSessionDraft.directoryOverride)
+      const nextProjectId = target.projectId ?? target.selectedProjectId ?? s.newSessionDraft.selectedProjectId
+      const targetChanged = nextProjectId !== s.newSessionDraft.selectedProjectId
+        || nextDirectory !== normalizePath(s.newSessionDraft.directoryOverride)
       return {
         newSessionDraft: {
           ...s.newSessionDraft,
-          selectedProjectId: target.projectId ?? target.selectedProjectId ?? s.newSessionDraft.selectedProjectId,
+          generation: targetChanged
+            ? nextDraftGeneration(s.newSessionDraft.generation)
+            : s.newSessionDraft.generation,
+          selectedProjectId: nextProjectId,
           directoryOverride: target.directoryOverride ?? s.newSessionDraft.directoryOverride,
         },
       }
@@ -1024,7 +1045,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
       set({ pendingChangesBarDismissed: map });
     }
 
-    const draft = get().newSessionDraft
+    const draft = options?.draft ?? get().newSessionDraft
     const trimmedAgent = typeof agent === "string" && agent.trim().length > 0 ? agent.trim() : undefined
 
     const goalArm = inputMode !== "shell" && content.trim().length > 0
@@ -1064,7 +1085,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
         modelID,
         agent: trimmedAgent,
         variant,
-      })
+      }, draft)
       if (!createdDraftSession) throw new Error("Failed to create session")
 
       const mergedAdditionalParts = createdDraftSession.syntheticParts?.length
@@ -1193,19 +1214,46 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
   // ---------------------------------------------------------------------------
   // createSession
   // ---------------------------------------------------------------------------
-  createSession: async (title, directoryOverride, parentID, metadata) => {
-    const draft = get().newSessionDraft
-    const targetFolderId = draft.targetFolderId
+  createSession: async (title, directoryOverride, parentID, metadata, options) => {
+    const draftOwner = options?.draftOwner
+    const targetFolderId = draftOwner?.targetFolderId
+    const activationContext = {
+      sessionId: get().currentSessionId,
+      draft: get().newSessionDraft,
+      activeProjectId: useProjectsStore.getState().activeProjectId,
+      directory: useDirectoryStore.getState().currentDirectory,
+    }
 
     try {
       const dir = directoryOverride ?? opencodeClient.getDirectory()
-      const session = await createSessionAction(title, dir, parentID ?? null, metadata)
+      const session = await createSessionAction(title, dir, parentID ?? null, metadata, {
+        activate: false,
+      })
       if (!session) return null
 
-      get().closeNewSessionDraft()
+      const sessionDirectory = normalizePath(session.directory ?? directoryOverride ?? null)
+      if (draftOwner && ownsCurrentDraft(draftOwner, get().newSessionDraft)) {
+        persistDraftTarget({
+          projectId: draftOwner.selectedProjectId ?? null,
+          directory: sessionDirectory,
+        })
+        get().closeNewSessionDraft()
+        get().setCurrentSession(session.id, sessionDirectory)
+        void activateConfigForDirectory(sessionDirectory).catch((error) => {
+          console.warn("Failed to activate directory after creating session:", error)
+        })
+      } else if (
+        !draftOwner
+        && get().currentSessionId === activationContext.sessionId
+        && get().newSessionDraft === activationContext.draft
+        && useProjectsStore.getState().activeProjectId === activationContext.activeProjectId
+        && useDirectoryStore.getState().currentDirectory === activationContext.directory
+      ) {
+        get().setCurrentSession(session.id, sessionDirectory)
+      }
 
       if (targetFolderId) {
-        const scopeKey = directoryOverride || get().lastLoadedDirectory || session.directory
+        const scopeKey = session.directory || directoryOverride || get().lastLoadedDirectory
         if (scopeKey) {
           useSessionFoldersStore.getState().addSessionToFolder(scopeKey, targetFolderId, session.id)
         }

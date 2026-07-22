@@ -8,7 +8,7 @@ import { useConfigStore } from '@/stores/useConfigStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { useMessageQueueStore, type QueuedMessage } from '@/stores/messageQueueStore';
 import { useAutoReviewStore } from '@/stores/useAutoReviewStore';
-import { useSessionUIStore } from '@/sync/session-ui-store';
+import { useSessionUIStore, type SessionUIState } from '@/sync/session-ui-store';
 import { useSelectionStore } from '@/sync/selection-store';
 import { useInputStore } from '@/sync/input-store';
 import type { AttachedFile } from '@/stores/types/sessionTypes';
@@ -1074,9 +1074,8 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     const pendingPastedAttachmentFilenamesRef = React.useRef<Set<string>>(new Set());
 
     // TODO: port sendMessage to session-actions (complex — creates sessions, handles attachments, etc.)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sendMessage = React.useRef((...args: any[]) =>
-        Promise.resolve((useSessionUIStore.getState().sendMessage as (...a: unknown[]) => unknown)(...args)),
+    const sendMessage = React.useRef<SessionUIState['sendMessage']>((...args) =>
+        useSessionUIStore.getState().sendMessage(...args),
     ).current;
     const currentSessionId = useSessionUIStore((s) => s.currentSessionId);
     const fallbackDirectory = useDirectoryStore((s) => s.currentDirectory);
@@ -1880,6 +1879,16 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
             return;
         }
 
+        // Capture the destination before any preprocessing awaits. A later
+        // session/draft switch must not retarget this submission.
+        const capturedSessionId = currentSessionId ?? undefined;
+        const capturedDraft = !capturedSessionId && newSessionDraftOpen ? newSessionDraft : undefined;
+        const sendMessageOptions: NonNullable<Parameters<SessionUIState['sendMessage']>[9]> = {
+            sessionId: capturedSessionId,
+            draft: capturedDraft,
+            ...(delivery ? { delivery } : {}),
+        };
+
         // Sending is authoritative: if a question prompt is open, dismiss it
         // so the prompt cannot linger or strand the session. The dismiss clears
         // the card instantly (optimistic) and formally rejects the question.
@@ -1901,8 +1910,6 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                 return;
             }
         }
-
-        const sendMessageOptions = delivery ? { delivery } : undefined;
 
         // Build the primary message (first part) and additional parts
         let primaryText = '';
