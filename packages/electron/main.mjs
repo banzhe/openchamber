@@ -21,6 +21,12 @@ import { checkForDesktopUpdate } from './updater-check.mjs';
 import { resolveUpdaterChannel } from './updater-channel.mjs';
 import { resolveUpdaterFeed } from './updater-feed.mjs';
 import {
+  buildWindowsProjectOpenSpecs,
+  resolveVsCodeExecutableFromShim,
+  resolveWindowsScriptExecutable,
+  runWindowsSpecChain,
+} from './windows-open-in-app.mjs';
+import {
   buildLinuxInstalledApps,
   buildLinuxOpenSpecs,
   fetchLinuxAppIcons,
@@ -3484,24 +3490,6 @@ const findWindowsExecutable = (appId) => {
   return null;
 };
 
-const resolveWindowsScriptIconExecutable = (scriptPath) => {
-  if (!scriptPath || !/\.(?:cmd|bat)$/i.test(scriptPath)) return null;
-  let source = '';
-  try {
-    source = fs.readFileSync(scriptPath, 'utf8');
-  } catch {
-    return null;
-  }
-  const scriptDir = path.dirname(scriptPath);
-  const matches = [...source.matchAll(/(?:(?:%~dp0|%~dp0\\|%~dp0\/|\.\.\\|\.\.\/|[A-Za-z]:\\|[A-Za-z]:\/)[^"'\r\n]*?\.exe)/gi)];
-  for (const match of matches) {
-    const raw = String(match[0] || '').replace(/^%~dp0[\\/]?/i, '').trim();
-    const candidate = path.isAbsolute(raw) ? raw : path.resolve(scriptDir, raw);
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return null;
-};
-
 let windowsTerminalPackagePathCache;
 
 const resolveWindowsTerminalPackagePath = () => {
@@ -3598,7 +3586,7 @@ const resolveWindowsAppIconExecutable = ({ appId, appName }) => {
   const executable = findWindowsExecutable(appId) || findWindowsAppNameExecutable(appName);
   if (!executable) return null;
   if (/\.exe$/i.test(executable)) return executable;
-  return resolveWindowsScriptIconExecutable(executable) || executable;
+  return resolveWindowsScriptExecutable(executable) || executable;
 };
 
 const windowsIconToDataUrl = async (executablePath) => {
@@ -3662,23 +3650,16 @@ const buildWindowsOpenProjectSpecs = ({ projectPath, appId, appName }) => {
     }
     return specs;
   }
-  const specs = [];
-  const cli = WINDOWS_CLI_BY_APP_ID[appId];
-  if (cli) {
-    const resolvedCli = runWhere(cli);
-    if (resolvedCli) {
-      specs.push({ program: resolvedCli, args: [projectPath] });
-    }
-  }
-  const exe = findWindowsExecutable(appId);
-  if (exe) {
-    specs.push({ program: exe, args: [projectPath] });
-  }
-  const namedExe = findWindowsAppNameExecutable(appName);
-  if (namedExe && !specs.some((spec) => spec.program === namedExe)) {
-    specs.push({ program: namedExe, args: [projectPath] });
-  }
-  return specs;
+  return buildWindowsProjectOpenSpecs({
+    appId,
+    appName,
+    targetPath: projectPath,
+    cliByAppId: WINDOWS_CLI_BY_APP_ID,
+    runWhere,
+    findExecutable: findWindowsExecutable,
+    findNamedExecutable: findWindowsAppNameExecutable,
+    resolveScriptExecutable: resolveVsCodeExecutableFromShim,
+  });
 };
 
 const buildWindowsOpenFileSpecs = ({ filePath, appId, appName }) => {
@@ -3761,6 +3742,12 @@ const resolveWindowsLaunchProgram = (program) => {
   return runWhere(program);
 };
 
+const waitForWindowsChildSpawn = (child) => new Promise((resolve, reject) => {
+  child.once('spawn', resolve);
+  child.once('error', reject);
+  child.unref();
+});
+
 const launchWindowsCommandScript = (spec, program) => {
   const commandLine = ['call', quoteWindowsCommandArg(program), ...spec.args.map(quoteWindowsCommandArg)].join(' ');
   const child = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', commandLine], {
@@ -3769,7 +3756,7 @@ const launchWindowsCommandScript = (spec, program) => {
     windowsHide: false,
     windowsVerbatimArguments: true,
   });
-  child.unref();
+  return waitForWindowsChildSpawn(child);
 };
 
 const launchWindowsSpec = (spec) => {
@@ -3786,13 +3773,11 @@ const launchWindowsSpec = (spec) => {
       windowsHide: false,
       windowsVerbatimArguments: true,
     });
-    child.unref();
-    return;
+    return waitForWindowsChildSpawn(child);
   }
 
   if (/\.(cmd|bat)$/i.test(program)) {
-    launchWindowsCommandScript(spec, program);
-    return;
+    return launchWindowsCommandScript(spec, program);
   }
 
   const child = spawn(program, spec.args, {
@@ -3800,25 +3785,16 @@ const launchWindowsSpec = (spec) => {
     stdio: 'ignore',
     windowsHide: false,
   });
-  child.unref();
+  return waitForWindowsChildSpawn(child);
 };
 
-const runSpecChain = (specs, appName) => {
+const runSpecChain = async (specs, appName) => {
   if (!Array.isArray(specs) || specs.length === 0) {
     throw new Error(`Failed to open in ${appName}: no launch candidates`);
   }
 
   if (process.platform === 'win32') {
-    const failures = [];
-    for (const spec of specs) {
-      try {
-        launchWindowsSpec(spec);
-        return;
-      } catch (error) {
-        failures.push(`${spec.program}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    throw new Error(`Failed to open in ${appName}: ${failures.join('; ')}`);
+    return runWindowsSpecChain(specs, appName, launchWindowsSpec);
   }
 
   const failures = [];
@@ -4282,7 +4258,7 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
           if (error) throw new Error(error);
           return null;
         }
-        runSpecChain(buildWindowsOpenProjectSpecs({ projectPath: validated.path, appId, appName }), appName);
+        await runSpecChain(buildWindowsOpenProjectSpecs({ projectPath: validated.path, appId, appName }), appName);
         return null;
       }
       if (process.platform === 'linux') {
@@ -4299,7 +4275,7 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       if (process.platform !== 'darwin') {
         throw new Error(unsupportedAppSpecificOpenError('projects'));
       }
-      runSpecChain(buildOpenProjectSpecs({ projectPath: validated.path, appId, appName }), appName);
+      await runSpecChain(buildOpenProjectSpecs({ projectPath: validated.path, appId, appName }), appName);
       return null;
     }
 
@@ -4312,7 +4288,7 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       }
       const validated = await validateLocalPath(filePath, 'File path');
       if (process.platform === 'win32') {
-        runSpecChain(buildWindowsOpenFileSpecs({ filePath: validated.path, appId, appName }), appName);
+        await runSpecChain(buildWindowsOpenFileSpecs({ filePath: validated.path, appId, appName }), appName);
         return null;
       }
       if (process.platform === 'linux') {
@@ -4329,7 +4305,7 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       if (process.platform !== 'darwin') {
         throw new Error(unsupportedAppSpecificOpenError('files'));
       }
-      runSpecChain(buildOpenFileSpecs({ filePath: validated.path, appId, appName }), appName);
+      await runSpecChain(buildOpenFileSpecs({ filePath: validated.path, appId, appName }), appName);
       return null;
     }
 
