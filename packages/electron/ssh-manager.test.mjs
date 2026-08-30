@@ -337,6 +337,7 @@ describe('ElectronSshManager', () => {
       emit: () => undefined,
     });
     manager.resolveRemoteTool = async () => '/home/pi/.opencode/bin/opencode';
+    manager.resolveRemoteNode = async () => '/home/pi/.bun/bin';
     manager.runRemoteCommand = async (_parsed, _controlPath, script) => {
       started = script;
       return '4321\n';
@@ -354,7 +355,35 @@ describe('ElectronSshManager', () => {
     expect(port).toBe(4321);
     expect(started).toContain("'/home/pi/.openchamber/npm-global/bin/openchamber' serve");
     expect(started).toContain("OPENCODE_BINARY='/home/pi/.opencode/bin/opencode'");
-    expect(started).toContain('$HOME/.opencode/bin:');
+    expect(started).toContain("PATH=\"/home/pi/.bun/bin:$HOME/.opencode/bin:");
+  });
+
+  test('resolves a node that only exists in a home directory so the env shebang can find it', async () => {
+    let probing = '';
+    const manager = new ElectronSshManager({
+      settingsFilePath: path.join(os.tmpdir(), 'unused-settings.json'),
+      appVersion: '1.2.3',
+      emit: () => undefined,
+    });
+    manager.runRemoteCommand = async (_parsed, _controlPath, script) => {
+      probing = script;
+      return '/home/pi/.nvm/versions/node/v22.9.0/bin/node\n';
+    };
+
+    const nodeBinDir = await manager.resolveRemoteNode({ destination: 'user@example.test', args: [] }, '/tmp/control.sock');
+
+    expect(nodeBinDir).toBe('/home/pi/.nvm/versions/node/v22.9.0/bin');
+    expect(probing).toContain('.nvm/versions/node/*/bin/node');
+    expect(probing).toContain('"$(command -v node 2>/dev/null)"');
+  });
+
+  test('uses the default node location when none is resolvable on the remote host', () => {
+    const manager = new ElectronSshManager({
+      settingsFilePath: path.join(os.tmpdir(), 'unused-settings.json'),
+      appVersion: '1.2.3',
+      emit: () => undefined,
+    });
+    expect(manager.remoteEnvPrefix(null)).toContain('$HOME/.nvm/versions/node/current/bin:');
   });
 
   test('refuses to start when the remote machine has no opencode CLI', async () => {
@@ -406,6 +435,7 @@ describe('ElectronSshManager', () => {
       scripts.push(script);
       return '';
     };
+    manager.resolveRemoteNode = async () => '/home/pi/.bun/bin';
 
     await manager.stopRemoteServerBestEffort(
       { destination: 'user@example.test', args: [] },
@@ -414,7 +444,9 @@ describe('ElectronSshManager', () => {
       '/home/pi/.bun/bin/openchamber',
     );
 
-    expect(scripts).toEqual(["'/home/pi/.bun/bin/openchamber' stop --port 41777"]);
+    expect(scripts).toHaveLength(1);
+    expect(scripts[0]).toContain("PATH=\"/home/pi/.bun/bin:");
+    expect(scripts[0]).toContain("'/home/pi/.bun/bin/openchamber' stop --port 41777");
   });
   test('publishes the remote server to its network only with a UI password', async () => {
     const manager = new ElectronSshManager({

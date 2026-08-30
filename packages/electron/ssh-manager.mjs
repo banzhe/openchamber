@@ -15,6 +15,27 @@ const DEFAULT_LOCAL_BIND_HOST = '127.0.0.1';
 // prefix inside the user's home instead.
 const REMOTE_USER_PREFIX = '$HOME/.openchamber/npm-global';
 const REMOTE_BUN_CANDIDATE = '"${BUN_INSTALL:-$HOME/.bun}/bin/bun"';
+// An SSH login shell does not source the user's interactive rc files, so node
+// installed into a home directory (nvm above all) is usually missing from PATH
+// even though it exists. The openchamber CLI entry (cli.js) and its bundled
+// server are `#!/usr/bin/env node`, so the server daemon cannot boot without a
+// reachable node. Resolve it here and prepend its bin directory to PATH the way
+// REMOTE_PATH_PREFIX already prefixes bun's. The nvm candidate is an unquoted
+// glob so `sh` pathname-expands it to every installed version; the rest are
+// quoted like the other candidate lists.
+const REMOTE_NODE_CANDIDATES = [
+  '$HOME/.nvm/versions/node/*/bin/node',
+  '"${BUN_INSTALL:-$HOME/.bun}/bin/node"',
+  '"$HOME/.node/bin/node"',
+  '"$HOME/.local/bin/node"',
+  '"$HOME/.volta/bin/node"',
+  '"$HOME/.fnm/bin/node"',
+];
+// Used when resolution fails: `current` is nvm's active-version symlink, and a
+// nonexistent PATH entry is harmless, so the fallback only salvages the nvm
+// layout and never hurts installs node already has elsewhere.
+const REMOTE_NODE_FALLBACK_BIN_DIR = '$HOME/.nvm/versions/node/current/bin';
+
 // The opencode CLI usually installs into the user's home, which an SSH login
 // shell does not have on PATH. The remote server only looks at OPENCODE_BINARY
 // and PATH, so resolve the CLI here and hand it over explicitly.
@@ -1009,6 +1030,24 @@ export class ElectronSshManager {
     return secret?.enabled && typeof secret.value === 'string' && secret.value.trim() ? secret.value.trim() : null;
   }
 
+  // Resolve the remote node binary and hand back its bin directory so the
+  // `#!/usr/bin/env node` server shebang can find it. See REMOTE_NODE_CANDIDATES
+  // for why PATH lookup alone is not enough.
+  async resolveRemoteNode(parsed, controlPath) {
+    const nodePath = await this.resolveRemoteTool(parsed, controlPath, 'node', REMOTE_NODE_CANDIDATES);
+    return nodePath ? path.posix.dirname(nodePath) : null;
+  }
+
+  // The openchamber CLI and its server are `#!/usr/bin/env node` and always
+  // start through a resolver binary in a bin directory, so PATH must include
+  // the directory holding node. A resolved node dir replaces the static
+  // fallback so a remote that only has node in a non-default location (nvm,
+  // volta, fnm above all) still boots.
+  remoteEnvPrefix(nodeBinDir) {
+    const fallbackDir = nodeBinDir || REMOTE_NODE_FALLBACK_BIN_DIR;
+    return `PATH="${fallbackDir}:${REMOTE_PATH_PREFIX}:$PATH"`;
+  }
+
   // A login shell over SSH does not source the user's interactive rc files, so
   // tools installed into a home directory (bun above all) are missing from PATH
   // even when they exist. Look at their known install locations too.
@@ -1144,6 +1183,7 @@ export class ElectronSshManager {
     if (!opencodePath) {
       throw new Error('The opencode CLI is not installed on the remote machine. Install it there, then connect again');
     }
+    const nodeBinDir = await this.resolveRemoteNode(parsed, controlPath);
 
     const secret = this.configuredOpenChamberPassword(instance);
     const remoteBindHost = instance.remoteOpenchamber?.bindHost === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1';
@@ -1153,7 +1193,7 @@ export class ElectronSshManager {
       throw new Error('Exposing the remote server to its network requires a UI password');
     }
 
-    let envPrefix = `PATH="${REMOTE_PATH_PREFIX}:$PATH" OPENCODE_BINARY=${shellQuote(opencodePath)} OPENCHAMBER_RUNTIME=ssh-remote`;
+    let envPrefix = `${this.remoteEnvPrefix(nodeBinDir)} OPENCODE_BINARY=${shellQuote(opencodePath)} OPENCHAMBER_RUNTIME=ssh-remote`;
     if (secret) {
       envPrefix += ` OPENCHAMBER_UI_PASSWORD=${shellQuote(secret)}`;
     }
@@ -1167,7 +1207,8 @@ export class ElectronSshManager {
   async stopRemoteServerBestEffort(parsed, controlPath, remotePort, remoteBinPath) {
     if (!remoteBinPath) return;
     try {
-      await this.runRemoteCommand(parsed, controlPath, `${shellQuote(remoteBinPath)} stop --port ${remotePort}`);
+      const nodeBinDir = await this.resolveRemoteNode(parsed, controlPath);
+      await this.runRemoteCommand(parsed, controlPath, `${this.remoteEnvPrefix(nodeBinDir)} ${shellQuote(remoteBinPath)} stop --port ${remotePort}`);
     } catch {
     }
   }
